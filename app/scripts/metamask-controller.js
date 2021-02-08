@@ -24,6 +24,7 @@ import {
   CurrencyRateController,
   PhishingController,
 } from '@metamask/controllers';
+import { PluginController } from '@mm-snap/controllers';
 import { getBackgroundMetaMetricState } from '../../ui/app/selectors';
 import { TRANSACTION_STATUSES } from '../../shared/constants/transaction';
 import ComposableObservableStore from './lib/ComposableObservableStore';
@@ -60,6 +61,7 @@ import accountImporter from './account-import-strategies';
 import seedPhraseVerifier from './lib/seed-phrase-verifier';
 import MetaMetricsController from './controllers/metametrics';
 import { segment, segmentLegacy } from './lib/segment';
+import { WORKER_BLOB_URL } from './lib/worker-blob';
 
 export default class MetamaskController extends EventEmitter {
   /**
@@ -251,6 +253,22 @@ export default class MetamaskController extends EventEmitter {
       initState.PermissionsMetadata,
     );
 
+    this.pluginController = new PluginController({
+      setupWorkerPluginProvider: this.setupWorkerPluginProvider.bind(this),
+      closeAllConnections: this.removeAllConnections.bind(this),
+      requestPermissions: this.permissionsController._requestPermissions.bind(
+        this.permissionsController,
+      ),
+      removeAllPermissionsFor: this.permissionsController.removeAllPermissionsFor.bind(
+        this.permissionsController,
+      ),
+      getAppKeyForDomain: this.keyringController.exportAppKeyForAddress.bind(
+        this.keyringController,
+      ),
+      workerUrl: WORKER_BLOB_URL,
+      initState: initState.PluginController,
+    });
+
     this.detectTokensController = new DetectTokensController({
       preferences: this.preferencesController,
       network: this.networkController,
@@ -375,6 +393,7 @@ export default class MetamaskController extends EventEmitter {
       IncomingTransactionsController: this.incomingTransactionsController.store,
       PermissionsController: this.permissionsController.permissions,
       PermissionsMetadata: this.permissionsController.store,
+      PluginController: this.pluginController.store,
       ThreeBoxController: this.threeBoxController.store,
     });
 
@@ -400,6 +419,7 @@ export default class MetamaskController extends EventEmitter {
       IncomingTransactionsController: this.incomingTransactionsController.store,
       PermissionsController: this.permissionsController.permissions,
       PermissionsMetadata: this.permissionsController.store,
+      PluginController: this.pluginController.memStore,
       ThreeBoxController: this.threeBoxController.store,
       SwapsController: this.swapsController.store,
       EnsController: this.ensController.store,
@@ -564,6 +584,7 @@ export default class MetamaskController extends EventEmitter {
       networkController,
       onboardingController,
       permissionsController,
+      pluginController,
       preferencesController,
       swapsController,
       threeBoxController,
@@ -882,6 +903,14 @@ export default class MetamaskController extends EventEmitter {
       trackMetaMetricsPage: nodeify(
         metaMetricsController.trackPage,
         metaMetricsController,
+      ),
+
+      // Plugins
+      runInlinePlugin: nodeify(
+        pluginController.runInlinePlugin.bind(pluginController),
+      ),
+      removeInlinePlugin: nodeify(
+        pluginController.removeInlinePlugin.bind(pluginController),
       ),
     };
   }
@@ -1885,25 +1914,34 @@ export default class MetamaskController extends EventEmitter {
    * @param {*} connectionStream - The Duplex stream to connect to.
    * @param {MessageSender} sender - The sender of the messages on this stream
    */
-  setupUntrustedCommunication(connectionStream, sender) {
+  setupUntrustedCommunication(connectionStream, sender, isPlugin = false) {
     const { usePhishDetect } = this.preferencesController.store.getState();
-    const { hostname } = new URL(sender.url);
-    // Check if new connection is blocked if phishing detection is on
-    if (usePhishDetect && this.phishingController.test(hostname)) {
-      log.debug('MetaMask - sending phishing warning for', hostname);
-      this.sendPhishingWarning(connectionStream, hostname);
-      return;
+
+    if (!isPlugin) {
+      const { hostname } = new URL(sender.url);
+      // Check if new connection is blocked if phishing detection is on
+      if (usePhishDetect && this.phishingController.test(hostname)) {
+        log.debug('MetaMask - sending phishing warning for', hostname);
+        this.sendPhishingWarning(connectionStream, hostname);
+        return;
+      }
     }
 
     // setup multiplexing
     const mux = setupMultiplex(connectionStream);
 
     // messages between inpage and background
-    this.setupProviderConnection(mux.createStream('metamask-provider'), sender);
+    this.setupProviderConnection(
+      mux.createStream('metamask-provider'),
+      sender,
+      isPlugin,
+    );
 
     // TODO:LegacyProvider: Delete
-    // legacy streams
-    this.setupPublicConfig(mux.createStream('publicConfig'));
+    if (!isPlugin) {
+      // legacy streams
+      this.setupPublicConfig(mux.createStream('publicConfig'));
+    }
   }
 
   /**
@@ -1978,7 +2016,7 @@ export default class MetamaskController extends EventEmitter {
    * @param {MessageSender} sender - The sender of the messages on this stream
    * @param {boolean} isInternal - True if this is a connection with an internal process
    */
-  setupProviderConnection(outStream, sender, isInternal) {
+  setupProviderConnection(outStream, sender, isInternal, isPlugin) {
     const origin = isInternal ? 'metamask' : new URL(sender.url).origin;
     let extensionId;
     if (sender.id !== this.extension.runtime.id) {
@@ -1995,6 +2033,7 @@ export default class MetamaskController extends EventEmitter {
       extensionId,
       tabId,
       isInternal,
+      isPlugin,
     });
 
     // setup connection
@@ -2017,6 +2056,13 @@ export default class MetamaskController extends EventEmitter {
   }
 
   /**
+   * For plugins running in workers.
+   */
+  setupWorkerPluginProvider(senderUrl, connectionStream, _workerId) {
+    this.setupUntrustedCommunication(connectionStream, senderUrl, true);
+  }
+
+  /**
    * A method for creating a provider that is safely restricted for the requesting domain.
    * @param {Object} options - Provider engine options
    * @param {string} options.origin - The origin of the sender
@@ -2031,6 +2077,7 @@ export default class MetamaskController extends EventEmitter {
     extensionId,
     tabId,
     isInternal = false,
+    isPlugin = false,
   }) {
     // setup json rpc engine stack
     const engine = new JsonRpcEngine();
@@ -2050,18 +2097,24 @@ export default class MetamaskController extends EventEmitter {
 
     // append origin to each request
     engine.push(createOriginMiddleware({ origin }));
+
     // append tabId to each request if it exists
     if (tabId) {
       engine.push(createTabIdMiddleware({ tabId }));
     }
+
     // logging
     engine.push(createLoggerMiddleware({ origin }));
-    engine.push(
-      createOnboardingMiddleware({
-        location,
-        registerOnboarding: this.onboardingController.registerOnboarding,
-      }),
-    );
+    if (!isPlugin) {
+      engine.push(
+        createOnboardingMiddleware({
+          location,
+          registerOnboarding: this.onboardingController.registerOnboarding,
+        }),
+      );
+    }
+
+    // Unrestricted/permissionless RPC method implementations
     engine.push(
       createMethodMiddleware({
         origin,
@@ -2080,6 +2133,7 @@ export default class MetamaskController extends EventEmitter {
         ),
       }),
     );
+
     // filter and subscription polyfills
     engine.push(filterMiddleware);
     engine.push(subscriptionManager.middleware);
@@ -2089,6 +2143,7 @@ export default class MetamaskController extends EventEmitter {
         this.permissionsController.createMiddleware({ origin, extensionId }),
       );
     }
+
     // forward to metamask primary provider
     engine.push(providerAsMiddleware(provider));
     return engine;
@@ -2161,6 +2216,24 @@ export default class MetamaskController extends EventEmitter {
     if (Object.keys(connections).length === 0) {
       delete this.connections[origin];
     }
+  }
+
+  /**
+   * Closes all connections for the given origin, and removes the references
+   * to them.
+   * Ignores unknown origins.
+   *
+   * @param {string} origin - The origin string.
+   */
+  removeAllConnections(origin) {
+    const connections = this.connections[origin];
+    if (!connections) {
+      return;
+    }
+
+    Object.keys(connections).forEach((id) => {
+      this.removeConnection(origin, id);
+    });
   }
 
   /**

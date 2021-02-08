@@ -72,6 +72,9 @@ export default class Home extends PureComponent {
     setWeb3ShimUsageAlertDismissed: PropTypes.func.isRequired,
     originOfCurrentTab: PropTypes.string,
     disableWeb3ShimUsageAlert: PropTypes.func.isRequired,
+    runInlinePlugin: PropTypes.func,
+    removeInlinePlugin: PropTypes.func,
+    inlinePluginIsRunning: PropTypes.bool,
   };
 
   state = {
@@ -282,6 +285,48 @@ export default class Home extends PureComponent {
     );
   };
 
+  renderPluginButtons = () => {
+    const {
+      inlinePluginIsRunning,
+      removeInlinePlugin,
+      runInlinePlugin,
+    } = this.props;
+
+    return (
+      <div>
+        {/* <Button
+          onClick={() => {
+            this.props.clearPlugins()
+          }}
+          disabled={!hasPlugins}
+        >
+          { 'Delete All Plugins' }
+        </Button>
+
+        <Button
+          onClick={() => {
+            this.props.clearAllPermissionsData()
+          }}
+          disabled={!hasPermissionsData}
+        >
+          { 'Delete All Permissions' }
+        </Button> */}
+
+        <Button
+          onClick={() => {
+            if (inlinePluginIsRunning) {
+              removeInlinePlugin();
+            } else {
+              runInlinePlugin();
+            }
+          }}
+        >
+          {inlinePluginIsRunning ? 'Remove Inline Plugin' : 'Run Inline Plugin'}
+        </Button>
+      </div>
+    );
+  };
+
   render() {
     const { t } = this.context;
     const {
@@ -352,6 +397,7 @@ export default class Home extends PureComponent {
           </div>
           {this.renderNotifications()}
         </div>
+        {this.renderPluginButtons()}
       </div>
     );
   }
